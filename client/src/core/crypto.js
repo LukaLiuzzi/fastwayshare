@@ -1,0 +1,150 @@
+/**
+ * FastWayShare — crypto.js
+ * End-to-end encryption using:
+ *   - ECDH (P-256) for key exchange
+ *   - HKDF for key derivation
+ *   - AES-256-GCM for authenticated encryption of file chunks
+ * Uses Web Crypto API exclusively (no external libraries).
+ */
+
+import { bufferToBase64, base64ToBuffer } from '../utils/helpers.js';
+
+const CURVE = 'P-256';
+const HASH = 'SHA-256';
+const AES_ALGO = 'AES-GCM';
+const AES_KEY_BITS = 256;
+const IV_BYTES = 12; // 96-bit IV for GCM
+
+/**
+ * Generate an ECDH key pair.
+ * @returns {Promise<{privateKey: CryptoKey, publicKey: CryptoKey, publicKeyB64: string}>}
+ */
+export async function generateECDHKeyPair() {
+  const keyPair = await crypto.subtle.generateKey(
+    { name: 'ECDH', namedCurve: CURVE },
+    true,
+    ['deriveKey', 'deriveBits']
+  );
+
+  // Export public key as base64 for transmission over signaling
+  const publicKeyRaw = await crypto.subtle.exportKey('raw', keyPair.publicKey);
+  const publicKeyB64 = bufferToBase64(publicKeyRaw);
+
+  return {
+    privateKey: keyPair.privateKey,
+    publicKey: keyPair.publicKey,
+    publicKeyB64,
+  };
+}
+
+/**
+ * Import a peer's public key from base64 (received via signaling).
+ * @param {string} publicKeyB64
+ * @returns {Promise<CryptoKey>}
+ */
+export async function importPeerPublicKey(publicKeyB64) {
+  const rawKey = base64ToBuffer(publicKeyB64);
+  return crypto.subtle.importKey(
+    'raw',
+    rawKey,
+    { name: 'ECDH', namedCurve: CURVE },
+    false,
+    []
+  );
+}
+
+/**
+ * Derive a shared AES-256-GCM key from ECDH keys using HKDF.
+ * Both peers derive the same key without it ever being transmitted.
+ * @param {CryptoKey} privateKey  Our private ECDH key
+ * @param {CryptoKey} peerPublicKey  Peer's public ECDH key
+ * @returns {Promise<CryptoKey>}  AES-256-GCM key
+ */
+export async function deriveSharedKey(privateKey, peerPublicKey) {
+  // Step 1: ECDH — derive shared secret bits
+  const sharedBits = await crypto.subtle.deriveBits(
+    { name: 'ECDH', public: peerPublicKey },
+    privateKey,
+    256
+  );
+
+  // Step 2: Import shared bits as HKDF key
+  const hkdfKey = await crypto.subtle.importKey(
+    'raw',
+    sharedBits,
+    'HKDF',
+    false,
+    ['deriveKey']
+  );
+
+  // Step 3: HKDF → AES-256-GCM key
+  return crypto.subtle.deriveKey(
+    {
+      name: 'HKDF',
+      hash: HASH,
+      salt: new TextEncoder().encode('FastWayShare-v1-salt'),
+      info: new TextEncoder().encode('FastWayShare-file-transfer'),
+    },
+    hkdfKey,
+    { name: AES_ALGO, length: AES_KEY_BITS },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+/**
+ * Encrypt a chunk of data with AES-256-GCM.
+ * Each chunk gets a unique random IV.
+ * The IV is prepended to the ciphertext (12 bytes + ciphertext + 16-byte auth tag).
+ *
+ * @param {ArrayBuffer} data  Plaintext chunk
+ * @param {CryptoKey} key  AES-GCM key
+ * @returns {Promise<ArrayBuffer>}  iv (12) + ciphertext + tag (16)
+ */
+export async function encryptChunk(data, key) {
+  const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: AES_ALGO, iv },
+    key,
+    data
+  );
+
+  // Prepend IV to ciphertext for self-contained transmission
+  const result = new Uint8Array(IV_BYTES + ciphertext.byteLength);
+  result.set(iv, 0);
+  result.set(new Uint8Array(ciphertext), IV_BYTES);
+  return result.buffer;
+}
+
+/**
+ * Decrypt a chunk of data with AES-256-GCM.
+ * Reads the IV from the first 12 bytes.
+ *
+ * @param {ArrayBuffer} data  iv (12) + ciphertext + tag (16)
+ * @param {CryptoKey} key  AES-GCM key
+ * @returns {Promise<ArrayBuffer>}  Decrypted plaintext
+ */
+export async function decryptChunk(data, key) {
+  const bytes = new Uint8Array(data);
+  const iv = bytes.slice(0, IV_BYTES);
+  const ciphertext = bytes.slice(IV_BYTES);
+
+  return crypto.subtle.decrypt(
+    { name: AES_ALGO, iv },
+    key,
+    ciphertext
+  );
+}
+
+/**
+ * Hash data with SHA-256.
+ * Used for file integrity verification after transfer.
+ * @param {ArrayBuffer} data
+ * @returns {Promise<string>}  hex digest
+ */
+export async function hashSHA256(data) {
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
