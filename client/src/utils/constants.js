@@ -5,20 +5,25 @@
  */
 
 // Signaling server URL — update after deploying the Cloudflare Worker
-export const SIGNALING_URL = import.meta.env.VITE_SIGNALING_URL || 'wss://fastwayshare-signaling.workers.dev';
+export const SIGNALING_URL =
+	import.meta.env.VITE_SIGNALING_URL || 'wss://fastwayshare.workers.dev';
 
 // WebRTC configuration
 export const ICE_SERVERS = [
-  // Free STUN servers (Google + Cloudflare)
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun.cloudflare.com:3478' },
-  // Optional TURN servers — users can override via env/config
-  ...(import.meta.env.VITE_TURN_URLS ? [{
-    urls: import.meta.env.VITE_TURN_URLS.split(','),
-    username: import.meta.env.VITE_TURN_USERNAME || '',
-    credential: import.meta.env.VITE_TURN_CREDENTIAL || '',
-  }] : []),
+	// Free STUN servers (Google + Cloudflare)
+	{ urls: 'stun:stun.l.google.com:19302' },
+	{ urls: 'stun:stun1.l.google.com:19302' },
+	{ urls: 'stun:stun.cloudflare.com:3478' },
+	// Optional TURN servers — users can override via env/config
+	...(import.meta.env.VITE_TURN_URLS
+		? [
+				{
+					urls: import.meta.env.VITE_TURN_URLS.split(','),
+					username: import.meta.env.VITE_TURN_USERNAME || '',
+					credential: import.meta.env.VITE_TURN_CREDENTIAL || '',
+				},
+			]
+		: []),
 ];
 
 // WebRTC data channel config
@@ -33,32 +38,39 @@ export const CRYPTO_IV_LENGTH = 12; // 12 bytes for GCM
 
 // Transfer protocol message types
 export const MSG = {
-  // Signaling
-  JOIN: 'JOIN',
-  JOINED: 'JOINED',
-  PEER_JOINED: 'PEER_JOINED',
-  PEER_DISCONNECTED: 'PEER_DISCONNECTED',
-  ROOM_FULL: 'ROOM_FULL',
-  OFFER: 'OFFER',
-  ANSWER: 'ANSWER',
-  ICE: 'ICE',
-  ECDH_KEY: 'ECDH_KEY',
-  ERROR: 'ERROR',
+	// Signaling
+	JOIN: 'JOIN',
+	JOINED: 'JOINED',
+	PEER_JOINED: 'PEER_JOINED',
+	PEER_DISCONNECTED: 'PEER_DISCONNECTED',
+	ROOM_FULL: 'ROOM_FULL',
+	OFFER: 'OFFER',
+	ANSWER: 'ANSWER',
+	ICE: 'ICE',
+	ECDH_KEY: 'ECDH_KEY',
+	ERROR: 'ERROR',
 
-  // Data channel (P2P)
-  FILE_OFFER: 'FILE_OFFER',
-  FILE_ACCEPT: 'FILE_ACCEPT',
-  FILE_REJECT: 'FILE_REJECT',
-  CHUNK: 'CHUNK',
-  CHUNK_ACK: 'CHUNK_ACK',
-  TRANSFER_COMPLETE: 'TRANSFER_COMPLETE',
-  TRANSFER_COMPLETE_ACK: 'TRANSFER_COMPLETE_ACK',
-  RESUME_REQUEST: 'RESUME_REQUEST',
-  CANCEL: 'CANCEL',
+	// Data channel (P2P)
+	FILE_OFFER: 'FILE_OFFER',
+	FILE_ACCEPT: 'FILE_ACCEPT',
+	FILE_REJECT: 'FILE_REJECT',
+	CHUNK: 'CHUNK',
+	CHUNK_ACK: 'CHUNK_ACK',
+	TRANSFER_COMPLETE: 'TRANSFER_COMPLETE',
+	TRANSFER_COMPLETE_ACK: 'TRANSFER_COMPLETE_ACK',
+	RESUME_REQUEST: 'RESUME_REQUEST',
+	CANCEL: 'CANCEL',
 };
 
 // Supported image preview types
-export const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml', 'image/bmp'];
+export const IMAGE_TYPES = [
+	'image/jpeg',
+	'image/png',
+	'image/gif',
+	'image/webp',
+	'image/svg+xml',
+	'image/bmp',
+];
 export const VIDEO_TYPES = ['video/mp4', 'video/webm', 'video/ogg'];
 
 // Room code format: 3 letters + dash + 4 digits e.g. "ABC-1234"
