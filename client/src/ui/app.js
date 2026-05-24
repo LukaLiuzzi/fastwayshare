@@ -70,8 +70,8 @@ export class App {
             <a href="#how-it-works" class="btn btn-ghost btn-sm">
               <span data-i18n="nav.how_it_works">${t('nav.how_it_works')}</span>
             </a>
-            <a href="https://github.com" target="_blank" rel="noopener" class="btn btn-ghost btn-sm">
-              <span>GitHub ↗</span>
+            <a href="https://github.com/LukaLiuzzi/fastwayshare" target="_blank" rel="noopener" class="btn btn-ghost btn-sm">
+              <span data-i18n="nav.github">${t('nav.github')} ↗</span>
             </a>
 
             <!-- Language toggle -->
@@ -223,7 +223,7 @@ export class App {
       <div class="container text-center">
         <p class="text-muted text-sm">
           ⚡ <strong>FastWayShare</strong> —
-          <a href="https://github.com" target="_blank" rel="noopener">Open Source</a> •
+          <a href="https://github.com/LukaLiuzzi/fastwayshare" target="_blank" rel="noopener" data-i18n="footer.open_source">${t('footer.open_source')}</a> •
           MIT License •
           <span data-i18n="privacy.e2e">${t('privacy.e2e')}</span>
         </p>

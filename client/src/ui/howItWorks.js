@@ -32,7 +32,7 @@ const STEPS = [
 const PRIVACY_BULLETS = [
   { icon: '🚫', key: 'privacy.zero_storage' },
   { icon: '🔒', key: 'privacy.e2e' },
-  { icon: '⚙️', key: 'privacy.open_source' },
+  { icon: '⭐', key: 'privacy.open_source' },
   { icon: '👤', key: 'privacy.no_account' },
   { icon: '📡', key: 'privacy.p2p' },
 ];

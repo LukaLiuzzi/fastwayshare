@@ -4,7 +4,8 @@
   "app.description": "Transfiere archivos directamente entre dispositivos, cifrado de extremo a extremo. Sin almacenamiento en servidor. 100% entre pares.",
 
   "nav.how_it_works": "Cómo funciona",
-  "nav.github": "GitHub",
+  "nav.github": "⭐ GitHub",
+  "footer.open_source": "⭐ Código Abierto",
 
   "hero.eyebrow": "Directo de navegador a navegador • Sin registros • 100% Gratis",
   "hero.title_1": "Comparte archivos",

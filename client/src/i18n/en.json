@@ -4,7 +4,8 @@
   "app.description": "Transfer files directly between devices, end-to-end encrypted. No server storage. 100% peer-to-peer.",
 
   "nav.how_it_works": "How it works",
-  "nav.github": "GitHub",
+  "nav.github": "⭐ GitHub",
+  "footer.open_source": "⭐ Open Source",
 
   "hero.eyebrow": "Browser to browser • No registration • 100% Free",
   "hero.title_1": "Share files",
