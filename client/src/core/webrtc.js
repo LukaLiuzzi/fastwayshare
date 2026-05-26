@@ -1,33 +1,56 @@
 /**
  * FastWayShare — webrtc.js
  * WebRTC connection manager.
- * Handles ICE negotiation, DataChannel creation, and connection type detection.
+ * Features:
+ *   - Multiple parallel DataChannels (configurable count)
+ *   - Ultra-local mode (STUN-only first, TURN fallback)
+ *   - Connection type + locality detection
+ *   - Flow control per-channel
+ *   - Trickle ICE (already default WebRTC behavior)
  */
 
-import { ICE_SERVERS, DATACHANNEL_LABEL, MSG } from '../utils/constants.js';
+import { DATACHANNEL_LABEL, MSG } from '../utils/constants.js';
+import { filterICEServers, detectConnectionLocality } from './networkDetect.js';
+
+const ULTRA_LOCAL_TIMEOUT_MS = 5000; // 5s — if no connection with STUN-only, add TURN
 
 export class WebRTCManager extends EventTarget {
   /** @type {RTCPeerConnection|null} */
   #pc = null;
-  /** @type {RTCDataChannel|null} */
-  #dc = null;
+  /** @type {RTCDataChannel[]} */
+  #channels = [];
+  #channelCount = 1;
+  #openChannels = 0;
   #isSender = false;
-  #connectionType = 'unknown'; // 'direct' | 'relay' | 'unknown'
+  #connectionType = 'unknown'; // 'local' | 'direct' | 'relay' | 'unknown'
+  #allIceServers = [];
+  #roundRobinIndex = 0;
 
   constructor() {
     super();
   }
 
   /**
-   * Initialize the peer connection with the given signaling client.
+   * Initialize the peer connection.
    * @param {import('./signaling.js').SignalingClient} signalingClient
-   * @param {boolean} isSender  true if this peer initiates the offer
+   * @param {boolean} isSender
+   * @param {object} [options]
+   * @param {number} [options.channelCount=1]
+   * @param {RTCIceServer[]} [options.iceServers]
    */
-  async init(signalingClient, isSender) {
+  async init(signalingClient, isSender, options = {}) {
     this.#isSender = isSender;
-    this.#pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    this.#channelCount = options.channelCount ?? 1;
+    this.#allIceServers = options.iceServers ?? [];
+    this.#openChannels = 0;
+    this.#channels = [];
+    this.#roundRobinIndex = 0;
 
-    // ICE candidate handling
+    // We ALWAYS try STUN-only first to prioritize local network (fastest route)
+    const initialServers = filterICEServers(this.#allIceServers, false); // STUN only
+    this.#pc = new RTCPeerConnection({ iceServers: initialServers });
+
+    // ICE candidate handling (trickle ICE)
     this.#pc.addEventListener('icecandidate', (event) => {
       if (event.candidate) {
         signalingClient.send({
@@ -36,6 +59,9 @@ export class WebRTCManager extends EventTarget {
         });
       }
     });
+
+    // Fallback: if no connection after timeout, restart ICE with TURN
+    this.#scheduleUltraLocalFallback(signalingClient);
 
     // Connection state
     this.#pc.addEventListener('connectionstatechange', () => {
@@ -50,7 +76,6 @@ export class WebRTCManager extends EventTarget {
       }
     });
 
-    // ICE connection state for relay detection
     this.#pc.addEventListener('iceconnectionstatechange', () => {
       if (this.#pc.iceConnectionState === 'connected') {
         this.#detectConnectionType();
@@ -58,29 +83,52 @@ export class WebRTCManager extends EventTarget {
     });
 
     if (isSender) {
-      // Sender creates data channel
-      this.#dc = this.#pc.createDataChannel(DATACHANNEL_LABEL, {
-        ordered: true,
-      });
-      this.#setupDataChannel(this.#dc);
+      // Sender creates N DataChannels
+      for (let i = 0; i < this.#channelCount; i++) {
+        const dc = this.#pc.createDataChannel(`${DATACHANNEL_LABEL}-${i}`, {
+          ordered: true,
+          negotiated: false,
+        });
+        this.#setupDataChannel(dc, i);
+        this.#channels.push(dc);
+      }
 
-      // Create offer
       const offer = await this.#pc.createOffer();
       await this.#pc.setLocalDescription(offer);
       signalingClient.send({ type: MSG.OFFER, sdp: offer });
     } else {
-      // Receiver waits for data channel
+      // Receiver waits for data channels
       this.#pc.addEventListener('datachannel', (event) => {
-        this.#dc = event.channel;
-        this.#setupDataChannel(this.#dc);
+        const dc = event.channel;
+        // Extract channel index from label
+        const match = dc.label.match(/-(\d+)$/);
+        const idx = match ? parseInt(match[1], 10) : this.#channels.length;
+        this.#channels[idx] = dc;
+        this.#setupDataChannel(dc, idx);
       });
     }
   }
 
+  #scheduleUltraLocalFallback(signalingClient) {
+    const timer = setTimeout(async () => {
+      // If still not connected, add TURN servers and restart ICE
+      if (this.#pc && this.#pc.connectionState !== 'connected') {
+        console.log('[WebRTC] Ultra-local fallback: adding TURN servers');
+        try {
+          this.#pc.setConfiguration({ iceServers: this.#allIceServers });
+          await this.#pc.restartIce?.();
+        } catch (e) {
+          console.warn('[WebRTC] ICE restart failed:', e);
+        }
+      }
+    }, ULTRA_LOCAL_TIMEOUT_MS);
+
+    // Cancel if we connect quickly
+    this.addEventListener('connected', () => clearTimeout(timer), { once: true });
+  }
+
   /**
    * Handle incoming SDP offer (receiver side).
-   * @param {RTCSessionDescriptionInit} offer
-   * @param {import('./signaling.js').SignalingClient} signalingClient
    */
   async handleOffer(offer, signalingClient) {
     await this.#pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -91,7 +139,6 @@ export class WebRTCManager extends EventTarget {
 
   /**
    * Handle incoming SDP answer (sender side).
-   * @param {RTCSessionDescriptionInit} answer
    */
   async handleAnswer(answer) {
     await this.#pc.setRemoteDescription(new RTCSessionDescription(answer));
@@ -99,7 +146,6 @@ export class WebRTCManager extends EventTarget {
 
   /**
    * Add an ICE candidate received from the peer.
-   * @param {RTCIceCandidateInit} candidate
    */
   async addIceCandidate(candidate) {
     try {
@@ -110,62 +156,99 @@ export class WebRTCManager extends EventTarget {
   }
 
   /**
-   * Wait for the DataChannel buffer to be below the threshold if needed (flow control).
-   * @returns {Promise<void>}
+   * Wait for the DataChannel buffer to be below the threshold (flow control).
+   * @param {number} [channelIndex=0]
    */
-  async waitForBuffer() {
-    if (!this.#dc || this.#dc.readyState !== 'open') return;
+  async waitForBuffer(channelIndex = 0) {
+    const dc = this.#channels[channelIndex] ?? this.#channels[0];
+    if (!dc || dc.readyState !== 'open') return;
 
-    const THRESHOLD = 1024 * 1024; // 1 MB buffer threshold
-    this.#dc.bufferedAmountLowThreshold = THRESHOLD;
+    const THRESHOLD = 1024 * 1024; // 1MB
+    dc.bufferedAmountLowThreshold = THRESHOLD;
 
-    if (this.#dc.bufferedAmount > THRESHOLD) {
+    if (dc.bufferedAmount > THRESHOLD) {
       await new Promise((resolve) => {
-        const onLow = () => {
-          cleanup();
-          resolve();
-        };
-        const onClose = () => {
-          cleanup();
-          resolve();
-        };
+        const onLow = () => { cleanup(); resolve(); };
+        const onClose = () => { cleanup(); resolve(); };
         const cleanup = () => {
-          this.#dc?.removeEventListener('bufferedamountlow', onLow);
-          this.#dc?.removeEventListener('close', onClose);
-          this.#dc?.removeEventListener('error', onClose);
+          dc?.removeEventListener('bufferedamountlow', onLow);
+          dc?.removeEventListener('close', onClose);
+          dc?.removeEventListener('error', onClose);
         };
-        this.#dc.addEventListener('bufferedamountlow', onLow);
-        this.#dc.addEventListener('close', onClose);
-        this.#dc.addEventListener('error', onClose);
+        dc.addEventListener('bufferedamountlow', onLow);
+        dc.addEventListener('close', onClose);
+        dc.addEventListener('error', onClose);
       });
     }
   }
 
   /**
-   * Send binary data over the DataChannel.
+   * Send binary data on a specific channel.
    * @param {ArrayBuffer} data
+   * @param {number} [channelIndex=0]
    */
-  sendData(data) {
-    if (this.#dc?.readyState === 'open') {
-      this.#dc.send(data);
+  sendData(data, channelIndex = 0) {
+    const dc = this.#channels[channelIndex] ?? this.#channels[0];
+    if (dc?.readyState === 'open') {
+      dc.send(data);
     }
   }
 
   /**
-   * Send a JSON message over the DataChannel.
-   * @param {object} msg
+   * Send binary data round-robin across open channels.
+   * @param {ArrayBuffer} data
+   * @returns {number} the channel index used
+   */
+  sendDataRoundRobin(data) {
+    const openChannels = this.#channels.filter(dc => dc?.readyState === 'open');
+    if (openChannels.length === 0) return -1;
+
+    this.#roundRobinIndex = (this.#roundRobinIndex + 1) % openChannels.length;
+    const dc = openChannels[this.#roundRobinIndex];
+    if (dc) {
+      dc.send(data);
+      return this.#roundRobinIndex;
+    }
+    return -1;
+  }
+
+  /**
+   * Wait for buffer on the least-busy open channel.
+   */
+  async waitForAnyBuffer() {
+    // Find the channel with lowest bufferedAmount
+    let best = null;
+    let bestIdx = 0;
+    for (let i = 0; i < this.#channels.length; i++) {
+      const dc = this.#channels[i];
+      if (dc?.readyState === 'open') {
+        if (!best || dc.bufferedAmount < best.bufferedAmount) {
+          best = dc;
+          bestIdx = i;
+        }
+      }
+    }
+    if (best) await this.waitForBuffer(bestIdx);
+  }
+
+  /**
+   * Send a JSON message over the first available DataChannel.
    */
   sendMessage(msg) {
-    if (this.#dc?.readyState === 'open') {
-      this.#dc.send(JSON.stringify(msg));
+    for (const dc of this.#channels) {
+      if (dc?.readyState === 'open') {
+        dc.send(JSON.stringify(msg));
+        return;
+      }
     }
   }
 
-  #setupDataChannel(dc) {
+  #setupDataChannel(dc, idx) {
     dc.binaryType = 'arraybuffer';
 
     dc.addEventListener('open', () => {
-      this.#emit('datachannel_open');
+      this.#openChannels++;
+      this.#emit('datachannel_open', { index: idx, openCount: this.#openChannels });
     });
 
     dc.addEventListener('message', (event) => {
@@ -183,45 +266,42 @@ export class WebRTCManager extends EventTarget {
     });
 
     dc.addEventListener('close', () => {
-      this.#emit('datachannel_close');
+      this.#openChannels = Math.max(0, this.#openChannels - 1);
+      this.#emit('datachannel_close', { index: idx });
     });
 
     dc.addEventListener('error', (e) => {
-      this.#emit('datachannel_error', { error: e });
+      this.#emit('datachannel_error', { error: e, index: idx });
     });
   }
 
   async #detectConnectionType() {
-    if (!this.#pc) return;
-    try {
-      const stats = await this.#pc.getStats();
-      for (const report of stats.values()) {
-        if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-          const localCandidate = stats.get(report.localCandidateId);
-          const remoteCandidate = stats.get(report.remoteCandidateId);
-          if (localCandidate?.candidateType === 'relay' || remoteCandidate?.candidateType === 'relay') {
-            this.#connectionType = 'relay';
-          } else {
-            this.#connectionType = 'direct';
-          }
-          this.#emit('connectiontype', { type: this.#connectionType });
-          break;
-        }
-      }
-    } catch {
-      // Stats not available in all browsers
-    }
+    const locality = await detectConnectionLocality(this.#pc);
+    this.#connectionType = locality;
+    this.#emit('connectiontype', { type: locality });
   }
 
+  /** Get the underlying RTCPeerConnection (for RTT monitoring) */
+  get pc() { return this.#pc; }
+
   close() {
-    this.#dc?.close();
+    for (const dc of this.#channels) {
+      try { dc?.close(); } catch { /* ignore */ }
+    }
+    this.#channels = [];
     this.#pc?.close();
-    this.#dc = null;
     this.#pc = null;
+    this.#openChannels = 0;
   }
 
   get connectionType() { return this.#connectionType; }
-  get isOpen() { return this.#dc?.readyState === 'open'; }
+  get isOpen() { return this.#channels.some(dc => dc?.readyState === 'open'); }
+  get allOpen() {
+    return this.#channels.length > 0 &&
+      this.#channels.every(dc => dc?.readyState === 'open');
+  }
+  get openChannelCount() { return this.#openChannels; }
+  get channelCount() { return this.#channelCount; }
 
   #emit(type, detail = null) {
     this.dispatchEvent(new CustomEvent(type, { detail }));

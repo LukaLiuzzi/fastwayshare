@@ -21,6 +21,7 @@ import { createProgressBar } from './progress.js';
 import { addHistoryEntry } from './history.js';
 import { notifyTransferComplete, showToast } from './notification.js';
 import { requestNotificationPermission } from './notification.js';
+import { createAdvancedOptions } from './advancedOptions.js';
 
 export class RoomView {
 	#container;
@@ -54,6 +55,14 @@ export class RoomView {
 		this.#renderLayout();
 		this.#setupEvents();
 
+		// Add Advanced Options
+		const advSend = createAdvancedOptions();
+		const sendOpts = this.#container.querySelector('#advanced-options-send');
+		if (sendOpts) {
+			sendOpts.appendChild(advSend);
+			sendOpts.classList.remove('hidden');
+		}
+
 		this.#onLangChange = () => {
 			this.#updateDynamicTranslations();
 			const sendPanel = this.#container.querySelector('#send-panel');
@@ -85,6 +94,9 @@ export class RoomView {
           <!-- Room setup info -->
           <div class="card-flat hidden" id="room-setup-card" style="background: rgba(10, 15, 26, 0.4); border-color: rgba(255, 255, 255, 0.05);"></div>
 
+          <!-- Advanced Options Send -->
+          <div id="advanced-options-send"></div>
+
           <div class="workspace-footer" id="send-footer-area">
             <a href="#/receive" class="btn btn-ghost btn-sm">
               📥 <span data-i18n="room.receive_label">${t('room.receive_label')}</span>
@@ -113,6 +125,8 @@ export class RoomView {
           </div>
 
           <div class="card-flat hidden" id="connection-card" style="background: rgba(10, 15, 26, 0.4); border-color: rgba(255, 255, 255, 0.05);"></div>
+
+
 
           <div class="workspace-footer" id="receive-footer-area">
             <a href="#/" class="btn btn-ghost btn-sm">
@@ -410,6 +424,8 @@ export class RoomView {
 				this.#setupTransferListeners();
 			}
 			this.#transfer.setSharedKey(sharedKey);
+			await this.#transfer.configureEncryption();
+			this.#transfer.startRTTMonitor();
 
 			// Both peers initialize WebRTC once they have the other's public key.
 			// The sender acts as the initiator. Close existing connection first.
@@ -470,6 +486,10 @@ export class RoomView {
 		this.#rtc.addEventListener('message', (e) => {
 			if (e.detail?.type === MSG.FILE_ACCEPT) {
 				this.#transfer?.onAccepted();
+			} else if (e.detail?.type === 'RETRY_TRANSFER') {
+				const sendActionCard = this.#container.querySelector('#send-action-card');
+				if (sendActionCard) sendActionCard.remove();
+				this.#showSendReady();
 			}
 		});
 
@@ -482,7 +502,108 @@ export class RoomView {
 		if (!this.#transfer) return;
 
 		this.#transfer.addEventListener('progress', (e) => {
-			this.#progressBar?.update(e.detail);
+			this.#progressBar?.update({ ...e.detail, showControls: true });
+		});
+
+		this.#transfer.addEventListener('needs_password', (e) => {
+			const isError = e.detail?.error;
+			
+			const overlay = document.createElement('div');
+			overlay.className = 'modal-backdrop anim-fade-in';
+			// Centering via flexbox is much more robust
+			overlay.style.cssText = 'position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 999; backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; padding: var(--space-4);';
+
+			const promptCard = document.createElement('div');
+			promptCard.className = 'card-flat anim-fade-in-up';
+			promptCard.style.cssText = 'box-shadow: 0 10px 40px rgba(0,0,0,0.8); max-width: 400px; width: 100%; background: var(--bg-card);';
+			promptCard.innerHTML = `
+				<h4 style="margin-bottom: var(--space-3);">🔒 <span data-i18n="options.aes_key">${t('options.aes_key') || 'Contraseña Requerida'}</span></h4>
+				<p class="text-sm text-secondary" style="margin-bottom: var(--space-4);"><span data-i18n="room.pwd_desc">${t('room.pwd_desc') || 'El emisor ha protegido esta transferencia con una contraseña. Introdúcela para descargar.'}</span></p>
+				${isError ? `<p class="text-sm" style="color: #ff6b6b; margin-bottom: var(--space-3);">❌ Contraseña incorrecta. Intente de nuevo.</p>` : ''}
+				<input type="password" class="input ${isError ? 'input-error' : ''}" id="pwd-input" placeholder="********" style="margin-bottom: var(--space-4);" />
+				<div class="flex gap-2">
+					<button class="btn btn-ghost" id="pwd-cancel" style="flex: 1;">Cancelar</button>
+					<button class="btn btn-primary" id="pwd-submit" style="flex: 1;">Aceptar</button>
+				</div>
+			`;
+
+			overlay.appendChild(promptCard);
+			document.body.appendChild(overlay);
+
+			const cleanup = () => {
+				overlay.remove();
+			};
+
+			promptCard.querySelector('#pwd-cancel').addEventListener('click', () => {
+				cleanup();
+				this.#transfer.providePassword(null);
+			});
+
+			promptCard.querySelector('#pwd-submit').addEventListener('click', () => {
+				const pwd = promptCard.querySelector('#pwd-input').value;
+				if (!pwd) return;
+				cleanup();
+				this.#transfer.providePassword(pwd);
+			});
+			
+			promptCard.querySelector('#pwd-input').addEventListener('keydown', (e) => {
+			    if (e.key === 'Enter') promptCard.querySelector('#pwd-submit').click();
+			});
+
+			promptCard.querySelector('#pwd-input').focus();
+		});
+
+		this.#transfer.addEventListener('paused', (e) => {
+			this.#progressBar?.setPausedState(true);
+		});
+
+		this.#transfer.addEventListener('resumed', (e) => {
+			this.#progressBar?.setPausedState(false);
+		});
+
+		this.#transfer.addEventListener('cancelled', () => {
+			this.#progressBar?.reset();
+			
+			const sendActionCard = this.#container.querySelector('#send-action-card');
+			if (sendActionCard) {
+				sendActionCard.innerHTML = `
+					<p class="text-sm text-secondary" style="margin-bottom:var(--space-3);">
+						⚠️ <span data-i18n="transfer.cancelled">${t('transfer.cancelled') || 'Transferencia cancelada'}</span>
+					</p>
+					<button class="btn btn-primary" id="retry-send-btn" style="width:100%;">
+						🔄 <span data-i18n="btn.retry">${t('btn.retry') || 'Reintentar'}</span>
+					</button>
+				`;
+				sendActionCard.querySelector('#retry-send-btn').addEventListener('click', () => {
+					sendActionCard.remove();
+					this.#showSendReady();
+				});
+			}
+
+			const recvProgressCard = this.#container.querySelector('#receive-progress-card');
+			if (recvProgressCard) {
+				recvProgressCard.innerHTML = `
+					<p class="text-sm text-secondary" style="margin-bottom:var(--space-3);">
+						⚠️ <span data-i18n="transfer.cancelled">${t('transfer.cancelled') || 'Transferencia cancelada'}</span>
+					</p>
+					<button class="btn btn-primary" id="retry-recv-btn" style="width:100%;">
+						🔄 <span data-i18n="btn.retry">${t('btn.retry') || 'Reintentar'}</span>
+					</button>
+				`;
+				recvProgressCard.querySelector('#retry-recv-btn').addEventListener('click', () => {
+					recvProgressCard.remove();
+					this.#rtc.sendMessage({ type: 'RETRY_TRANSFER' });
+					
+					const transferCard = this.#container.querySelector('.transfer-steps') || this.#container;
+					const card = document.createElement('div');
+					card.className = 'card-flat anim-fade-in';
+					card.id = 'receive-progress-card';
+					card.innerHTML = `<span class="anim-spin">⏳</span> <span class="text-sm text-secondary" data-i18n="room.waiting">${t('room.waiting')}</span>`;
+					transferCard.appendChild(card);
+				});
+			}
+
+			showToast(t('transfer.cancelled') || 'Transfer cancelled.', 'info');
 		});
 
 		this.#transfer.addEventListener('receive_started', (e) => {
@@ -704,7 +825,19 @@ export class RoomView {
 		actionCard.className = 'card-flat anim-fade-in';
 		actionCard.id = 'send-action-card';
 
-		const pb = createProgressBar();
+		const pb = createProgressBar({
+			onPause: () => {
+				this.#transfer.pauseSend();
+				pb.setPausedState(true);
+			},
+			onResume: () => {
+				this.#transfer.resumeSend();
+				pb.setPausedState(false);
+			},
+			onCancel: () => {
+				this.#transfer.cancelSend();
+			}
+		});
 		this.#progressBar = pb;
 
 		const statusLabel = document.createElement('p');
@@ -738,7 +871,19 @@ export class RoomView {
 		progressCard.className = 'card-flat anim-fade-in';
 		progressCard.id = 'receive-progress-card';
 
-		const pb = createProgressBar();
+		const pb = createProgressBar({
+			onPause: () => {
+				this.#transfer.pauseReceive();
+				pb.setPausedState(true);
+			},
+			onResume: () => {
+				this.#transfer.resumeReceive();
+				pb.setPausedState(false);
+			},
+			onCancel: () => {
+				this.#transfer.cancelReceive();
+			}
+		});
 		this.#progressBar = pb;
 		const progress = bytesReceived / meta.size;
 		pb.update({

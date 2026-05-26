@@ -2,24 +2,40 @@
  * FastWayShare — transfer.js
  * Transfer orchestrator.
  * Manages the full lifecycle of sending/receiving files:
- * - File offer/accept handshake
- * - Encrypted chunk sending with ACK-based flow control
- * - Progress tracking (speed, ETA)
- * - Resumable transfers
- * - Multi-file queue
+ *
+ * NEW FEATURES:
+ *   - Optional AES-256-GCM encryption (off by default, WebRTC DTLS always active)
+ *   - Passphrase-based AES key derivation (PBKDF2)
+ *   - Pause/cancel for both sender AND receiver
+ *   - Receiver pause → sends PAUSE message to sender
+ *   - Pre-buffering chunks during ICE negotiation
+ *   - Chunk prioritization (high-priority chunks sent first)
+ *   - Round-robin chunk distribution across parallel DataChannels
+ *   - Adaptive chunk size via RTT monitor
+ *   - Chunk deduplication via CHUNK_MAP on resume
+ *   - Wake Lock integration for mobile
+ *   - Auto-reconnect tracking
  */
 
 import { MSG, CHUNK_SIZE } from '../utils/constants.js';
-import { encryptChunk, decryptChunk, hashSHA256 } from './crypto.js';
-import { FileChunker, FileStreamWriter, compressToZip } from './chunker.js';
+import {
+  encryptChunk, decryptChunk, hashSHA256,
+  deriveKeyFromPassphrase, generateSalt, passthroughChunk,
+} from './crypto.js';
+import { PrioritizedFileChunker, FileStreamWriter, compressToZip } from './chunker.js';
 import { formatBytes } from '../utils/helpers.js';
-import { saveTransferMeta, getSavedChunkCount, deleteTransfer, getAllChunks } from '../utils/db.js';
+import { saveTransferMeta, getSavedChunkCount, deleteTransfer, getAllChunks, getContiguousChunkCount } from '../utils/db.js';
+import { RTTMonitor } from './adaptiveChunk.js';
+import { settings } from './settings.js';
 
-const SPEED_WINDOW = 3000; // 3s rolling average for speed calculation
+const SPEED_WINDOW = 3000;
+const PIPELINE_BUFFER_SIZE = 32; // pre-buffer 32 chunks during ICE
+
+// ─── Chunk Pipeline ───────────────────────────────────────────────────────────
 
 class ChunkPipeline {
   #chunker;
-  #sharedKey;
+  #encryptFn;
   #bufferSize;
   #queue = [];
   #error = null;
@@ -28,9 +44,9 @@ class ChunkPipeline {
   #waiters = [];
   #spaceWaiters = [];
 
-  constructor(chunker, sharedKey, bufferSize = 8) {
+  constructor(chunker, encryptFn, bufferSize = PIPELINE_BUFFER_SIZE) {
     this.#chunker = chunker;
-    this.#sharedKey = sharedKey;
+    this.#encryptFn = encryptFn;
     this.#bufferSize = bufferSize;
   }
 
@@ -50,22 +66,22 @@ class ChunkPipeline {
         if (!chunk) break;
 
         const encryptPromise = (async () => {
-          const encrypted = await encryptChunk(chunk.data, this.#sharedKey);
+          const encrypted = await this.#encryptFn(chunk.data);
           return {
             data: encrypted,
             isLast: chunk.isLast,
             offset: chunk.offset,
-            length: chunk.data.byteLength
+            length: chunk.data.byteLength,
+            priority: chunk.priority ?? 'normal',
           };
         })();
 
         this.#queue.push(encryptPromise);
-        
+
         if (this.#waiters.length > 0) {
           this.#waiters.shift()();
         }
       }
-      
       while (this.#waiters.length > 0) {
         this.#waiters.shift()();
       }
@@ -78,38 +94,28 @@ class ChunkPipeline {
   }
 
   async next() {
-    if (this.#error) {
-      throw this.#error;
-    }
+    if (this.#error) throw this.#error;
     while (this.#queue.length === 0) {
-      if (this.#chunker.done) {
-        return null;
-      }
-      if (this.#error) {
-        throw this.#error;
-      }
+      if (this.#chunker.done) return null;
+      if (this.#error) throw this.#error;
       await new Promise(resolve => this.#waiters.push(resolve));
     }
-    
+
     const item = this.#queue.shift();
-    
     if (this.#spaceWaiters.length > 0) {
       this.#spaceWaiters.shift()();
     }
-    
     return item;
   }
 
   cancel() {
     this.#running = false;
-    while (this.#waiters.length > 0) {
-      this.#waiters.shift()();
-    }
-    while (this.#spaceWaiters.length > 0) {
-      this.#spaceWaiters.shift()();
-    }
+    while (this.#waiters.length > 0) this.#waiters.shift()();
+    while (this.#spaceWaiters.length > 0) this.#spaceWaiters.shift()();
   }
 }
+
+// ─── TransferManager ─────────────────────────────────────────────────────────
 
 export class TransferManager extends EventTarget {
   /** @type {import('./webrtc.js').WebRTCManager} */
@@ -117,19 +123,30 @@ export class TransferManager extends EventTarget {
   /** @type {CryptoKey|null} */
   #sharedKey = null;
 
+  // Encryption mode
+  #aesEnabled = false;
+  #aesPassphrase = '';
+  #aesKey = null;      // resolved AES key (from ECDH or PBKDF2)
+  #passwordPromiseResolve = null;
+
   // Sender state
-  #sendQueue = []; // Array<File>
-  #currentSender = null; // { chunker, meta, startTime, bytesSent, speedSamples }
+  #sendQueue = [];
+  #currentSender = null;
 
   // Receiver state
-  #currentReceiver = null; // { writer, meta, bytesReceived, speedSamples }
+  #currentReceiver = null;
 
   // Completed hashes in current session
   #completedHashes = new Set();
 
   // Pause/cancel flags
-  #paused = false;
-  #cancelled = false;
+  #sendPaused = false;
+  #sendCancelled = false;
+  #recvPaused = false;
+  #recvCancelled = false;
+
+  // RTT monitor (adaptive chunk size)
+  #rttMonitor = null;
 
   /**
    * @param {import('./webrtc.js').WebRTCManager} rtcManager
@@ -140,25 +157,87 @@ export class TransferManager extends EventTarget {
     this.#setupListeners();
   }
 
-  /** Set the shared AES key derived from ECDH */
+  /** Set the ECDH-derived shared AES key */
   setSharedKey(key) {
     this.#sharedKey = key;
   }
 
+  /**
+   * Configure encryption mode from settings.
+   * Must be called before starting a transfer.
+   */
+  async configureEncryption() {
+    this.#aesEnabled = settings.get('aesEnabled');
+    this.#aesPassphrase = settings.get('aesPassphrase') || '';
+
+    if (!this.#aesEnabled) {
+      this.#aesKey = null;
+      return;
+    }
+
+    // If passphrase provided, PBKDF2 key will be derived when we know the salt
+    // (salt is generated by sender and transmitted in FILE_OFFER)
+    // For now just store the mode; key derivation happens in #sendNext or #handleFileOffer
+    if (!this.#aesPassphrase) {
+      // Use ECDH key (set via setSharedKey)
+      this.#aesKey = this.#sharedKey;
+    }
+    // If passphrase is set, key derived later when salt is known
+  }
+
+  /**
+   * Build the encrypt function for ChunkPipeline.
+   * Returns async (data: ArrayBuffer) => ArrayBuffer
+   */
+  #getEncryptFn(aesKey) {
+    if (!this.#aesEnabled || !aesKey) {
+      return passthroughChunk;
+    }
+    return (data) => encryptChunk(data, aesKey);
+  }
+
+  /**
+   * Build the decrypt function for received chunks.
+   * Returns async (data: ArrayBuffer) => ArrayBuffer
+   */
+  #getDecryptFn(aesKey) {
+    if (!this.#aesEnabled || !aesKey) {
+      return passthroughChunk;
+    }
+    return (data) => decryptChunk(data, aesKey);
+  }
+
+  /** Start RTT monitoring for adaptive chunk size */
+  startRTTMonitor() {
+    if (this.#rttMonitor) {
+      this.#rttMonitor.stop();
+    }
+    if (this.#rtc.pc) {
+      this.#rttMonitor = new RTTMonitor(this.#rtc.pc);
+      this.#rttMonitor.addEventListener('update', (e) => {
+        const { optimalChunkSize } = e.detail;
+        if (this.#currentSender?.chunker) {
+          this.#currentSender.chunker.setChunkSize(optimalChunkSize);
+        }
+      });
+      this.#rttMonitor.start();
+    }
+  }
+
+  stopRTTMonitor() {
+    this.#rttMonitor?.stop();
+    this.#rttMonitor = null;
+  }
+
   #setupListeners() {
-    // Listen for control messages from the peer (via DataChannel)
     this.#rtc.addEventListener('message', (e) => this.#handleMessage(e.detail));
-    // Listen for binary chunks
     this.#rtc.addEventListener('chunk', (e) => this.#handleChunk(e.detail));
-    // Re-offer active file when data channel opens
     this.#rtc.addEventListener('datachannel_open', () => this.#handleDataChannelOpen());
-    // Listen for WebRTC connection disconnect
     this.#rtc.addEventListener('disconnected', () => this.#handleDisconnect());
   }
 
   #handleDataChannelOpen() {
     if (this.#currentSender) {
-      // Re-offer the file to the newly connected receiver
       this.#rtc.sendMessage({ type: MSG.FILE_OFFER, meta: this.#currentSender.meta });
       this.#emit('offer_sent', { meta: this.#currentSender.meta });
     }
@@ -169,28 +248,31 @@ export class TransferManager extends EventTarget {
       this.#emit('progress', {
         filename: this.#currentSender.meta.filename,
         progress: this.#currentSender.bytesSent / this.#currentSender.meta.size,
-        speed: 0,
-        eta: Infinity,
+        speed: 0, eta: Infinity,
         bytesSent: this.#currentSender.bytesSent,
         totalSize: this.#currentSender.meta.size,
-        status: 'disconnected',
-        direction: 'send',
+        status: 'disconnected', direction: 'send',
       });
     } else if (this.#currentReceiver) {
       this.#emit('progress', {
         filename: this.#currentReceiver.meta.filename,
         progress: this.#currentReceiver.bytesReceived / this.#currentReceiver.meta.size,
-        speed: 0,
-        eta: Infinity,
+        speed: 0, eta: Infinity,
         bytesReceived: this.#currentReceiver.bytesReceived,
         totalSize: this.#currentReceiver.meta.size,
-        status: 'disconnected',
-        direction: 'receive',
+        status: 'disconnected', direction: 'receive',
       });
     }
   }
 
-  // ─── SENDER ────────────────────────────────────────────────────────────────
+  providePassword(pwd) {
+    if (this.#passwordPromiseResolve) {
+      this.#passwordPromiseResolve(pwd);
+      this.#passwordPromiseResolve = null;
+    }
+  }
+
+  // ─── Helpers ────────────────────────────────────────────────────────────────
 
   /**
    * Queue files for sending.
@@ -198,16 +280,11 @@ export class TransferManager extends EventTarget {
    */
   async send(files) {
     if (files.length > 1) {
-      // Emit zipping status to notify the UI
       this.#emit('progress', {
         filename: 'fastwayshare.zip',
-        progress: 0,
-        speed: 0,
-        eta: Infinity,
-        bytesSent: 0,
-        totalSize: 0,
-        status: 'zipping',
-        direction: 'send',
+        progress: 0, speed: 0, eta: Infinity,
+        bytesSent: 0, totalSize: 0,
+        status: 'zipping', direction: 'send',
       });
 
       try {
@@ -233,21 +310,33 @@ export class TransferManager extends EventTarget {
       return;
     }
     const file = this.#sendQueue.shift();
-    const chunker = new FileChunker(file);
+    const chunker = new PrioritizedFileChunker(file);
 
-    // Compute SHA-256 hash before sending (for integrity check)
-    this.#emit('hashing', { filename: file.name });
     this.#emit('progress', {
       filename: file.name,
-      progress: 0,
-      speed: 0,
-      eta: Infinity,
-      bytesSent: 0,
-      totalSize: file.size,
-      status: 'hashing',
-      direction: 'send',
+      progress: 0, speed: 0, eta: Infinity,
+      bytesSent: 0, totalSize: file.size,
+      status: 'hashing', direction: 'send',
     });
+
     const hash = await chunker.computeHash();
+
+    let aesSalt = null;
+    let aesKey = null;
+    let aesTest = null;
+
+    if (this.#aesEnabled) {
+      if (this.#aesPassphrase) {
+        aesSalt = generateSalt();
+        aesKey = await deriveKeyFromPassphrase(this.#aesPassphrase, aesSalt);
+        const magic = new TextEncoder().encode('FASTWAYSHARE_OK');
+        const encryptedMagic = await encryptChunk(magic.buffer, aesKey);
+        aesTest = Array.from(new Uint8Array(encryptedMagic));
+      } else {
+        aesKey = this.#sharedKey;
+      }
+    }
+    this.#aesKey = aesKey;
 
     const meta = {
       filename: file.name,
@@ -255,12 +344,17 @@ export class TransferManager extends EventTarget {
       mimeType: file.type || 'application/octet-stream',
       totalChunks: chunker.totalChunks,
       hash,
+      // Encryption metadata
+      aesEnabled: this.#aesEnabled,
+      aesSalt: aesSalt ? Array.from(aesSalt) : null, // serialize for JSON
+      aesTest: aesTest,
     };
 
     this.#currentSender = {
       chunker,
       meta,
       file,
+      aesKey,
       startTime: Date.now(),
       bytesSent: 0,
       lastSpeedUpdate: Date.now(),
@@ -268,61 +362,76 @@ export class TransferManager extends EventTarget {
       speed: 0,
     };
 
-    // Send FILE_OFFER to receiver
+    // Start pre-buffering pipeline BEFORE DataChannel might be open
+    // (pipeline starts reading file + encrypting while ICE negotiates)
+    const encryptFn = this.#getEncryptFn(aesKey);
+    const pipeline = new ChunkPipeline(chunker, encryptFn, PIPELINE_BUFFER_SIZE);
+    this.#currentSender.pipeline = pipeline;
+    pipeline.start();
+
+    // Send FILE_OFFER to receiver (if DataChannel already open)
     this.#rtc.sendMessage({ type: MSG.FILE_OFFER, meta });
     this.#emit('offer_sent', { meta });
   }
 
-  async #sendChunks(resumeOffset = 0) {
+  async #sendChunks(resumeOffset = 0, knownChunks = null) {
     const s = this.#currentSender;
     if (!s) return;
 
-    s.chunker.seek(resumeOffset);
-    s.bytesSent = resumeOffset;
-    this.#cancelled = false;
-    this.#paused = false;
+    // If resuming, rebuild pipeline from resume offset
+    if (resumeOffset > 0) {
+      s.pipeline?.cancel();
+      s.chunker.seek(resumeOffset);
+      s.bytesSent = resumeOffset;
 
-    // Create and start pipeline for pre-reading and encrypting chunks
-    const pipeline = new ChunkPipeline(s.chunker, this.#sharedKey, 16);
-    s.pipeline = pipeline;
-    pipeline.start();
+      const encryptFn = this.#getEncryptFn(s.aesKey);
+      const pipeline = new ChunkPipeline(s.chunker, encryptFn, PIPELINE_BUFFER_SIZE);
+      s.pipeline = pipeline;
+      pipeline.start();
+    } else {
+      s.bytesSent = 0;
+    }
+
+    this.#sendCancelled = false;
+    this.#sendPaused = false;
+
+    // Build set of chunks to skip (deduplication via CHUNK_MAP)
+    const skipChunks = new Set(knownChunks ?? []);
 
     try {
-      while (!this.#cancelled) {
-        if (!this.#rtc.isOpen) {
-          break;
-        }
+      while (!this.#sendCancelled) {
+        if (!this.#rtc.isOpen) break;
 
-        // Pause support
-        if (this.#paused) {
+        // Sender pause (local or from receiver's PAUSE message)
+        if (this.#sendPaused) {
           await new Promise(resolve => {
-            const handler = () => { resolve(); this.removeEventListener('resume', handler); };
-            this.addEventListener('resume', handler);
+            const handler = () => { resolve(); this.removeEventListener('_send_resume', handler); };
+            this.addEventListener('_send_resume', handler);
           });
         }
 
-        const chunkPromise = await pipeline.next();
+        const chunkPromise = await s.pipeline.next();
         if (!chunkPromise) break;
 
         const chunk = await chunkPromise;
+        if (!this.#rtc.isOpen) break;
 
-        if (!this.#rtc.isOpen) {
-          break;
+        // Skip if receiver already has this chunk (dedup)
+        const chunkIndex = Math.floor(chunk.offset / (s.chunker.chunkSize || CHUNK_SIZE));
+        if (skipChunks.has(chunkIndex)) {
+          s.bytesSent = chunk.offset + chunk.length;
+          continue;
         }
 
-        // Wait for DataChannel backpressure to clear (flow control)
-        await this.#rtc.waitForBuffer();
+        // Flow control — wait for buffer capacity
+        await this.#rtc.waitForAnyBuffer();
+        if (!this.#rtc.isOpen) break;
 
-        if (!this.#rtc.isOpen) {
-          break;
-        }
-
-        // Send raw encrypted binary
-        this.#rtc.sendData(chunk.data);
-
+        // Send via round-robin across parallel channels
+        this.#rtc.sendDataRoundRobin(chunk.data);
         s.bytesSent = chunk.offset + chunk.length;
 
-        // Update speed (rolling window)
+        // Speed tracking
         const now = Date.now();
         const elapsed = (now - s.lastSpeedUpdate) / 1000;
         if (elapsed >= 0.5) {
@@ -338,22 +447,16 @@ export class TransferManager extends EventTarget {
           filename: s.meta.filename,
           bytesSent: s.bytesSent,
           totalSize: s.meta.size,
-          progress,
-          speed: s.speed,
-          eta,
-          direction: 'send',
-          status: 'transferring',
+          progress, speed: s.speed, eta,
+          direction: 'send', status: 'transferring',
         });
 
         if (chunk.isLast) {
-          // Notify transfer complete with hash
           this.#rtc.sendMessage({
             type: MSG.TRANSFER_COMPLETE,
             hash: s.meta.hash,
             filename: s.meta.filename,
           });
-          // Do NOT clear currentSender or emit send_complete yet.
-          // We will do that once we receive TRANSFER_COMPLETE_ACK.
           break;
         }
       }
@@ -361,7 +464,7 @@ export class TransferManager extends EventTarget {
       console.error('Error in sendChunks pipeline:', err);
       this.#emit('error', { error: err.message });
     } finally {
-      pipeline.cancel();
+      s.pipeline?.cancel();
     }
   }
 
@@ -376,20 +479,42 @@ export class TransferManager extends EventTarget {
         await this.#handleTransferComplete(msg);
         break;
       case MSG.RESUME_REQUEST:
-        await this.#sendChunks(msg.offset);
+        await this.#sendChunks(msg.offset, msg.knownChunks ?? null);
         break;
       case MSG.TRANSFER_COMPLETE_ACK:
         await this.#handleTransferCompleteAck(msg.hash);
         break;
       case MSG.CANCEL:
-        this.#cancelled = true;
-        if (this.#currentReceiver) {
-          deleteTransfer(this.#currentReceiver.meta.hash).catch(err => console.error(err));
-          this.#currentReceiver = null;
-        }
-        this.#emit('cancelled');
+        this.#handleRemoteCancel();
+        break;
+      case MSG.PAUSE:
+        // Receiver asked sender to pause
+        this.#sendPaused = true;
+        this.#emit('paused');
+        break;
+      case MSG.RESUME:
+        // Receiver asked sender to resume
+        this.#sendPaused = false;
+        this.dispatchEvent(new Event('_send_resume'));
+        this.#emit('resumed');
+        break;
+      case MSG.RTT_PING:
+        this.#rtc.sendMessage({ type: MSG.RTT_PONG, id: msg.id, ts: msg.ts });
         break;
     }
+  }
+
+  #handleRemoteCancel() {
+    this.#sendCancelled = true;
+    this.#recvCancelled = true;
+    if (this.#currentSender?.pipeline) {
+      this.#currentSender.pipeline.cancel();
+    }
+    if (this.#currentReceiver) {
+      deleteTransfer(this.#currentReceiver.meta.hash).catch(console.error);
+      this.#currentReceiver = null;
+    }
+    this.#emit('cancelled');
   }
 
   async #handleTransferCompleteAck(hash) {
@@ -407,24 +532,63 @@ export class TransferManager extends EventTarget {
   }
 
   async #handleFileOffer(meta) {
-    // If we already successfully completed this file in this session, ACK it immediately
     if (this.#completedHashes.has(meta.hash)) {
       this.#rtc.sendMessage({ type: MSG.TRANSFER_COMPLETE_ACK, hash: meta.hash });
       return;
     }
 
     this.#emit('file_offered', { meta });
+    this.#recvCancelled = false;
+    this.#recvPaused = false;
 
-    // Save transfer metadata
     await saveTransferMeta(meta);
 
-    // writer.init() internally calls getContiguousChunkCount() and returns
-    // the safe resume offset so we use a single DB query for both.
     const writer = new FileStreamWriter(meta.filename, meta.size, meta.hash);
     const savedChunks = await writer.init();
     const isResuming = savedChunks > 0;
-    // Clamp so initialBytes never exceeds file size (last chunk may be < CHUNK_SIZE)
     const initialBytes = Math.min(savedChunks * CHUNK_SIZE, meta.size);
+
+    // Resolve AES key for decryption
+    let aesKey = null;
+    if (meta.aesEnabled) {
+      if (meta.aesSalt) {
+        let isError = false;
+        while (true) {
+          // We need the passphrase. Pause and ask the UI.
+          this.#emit('needs_password', { error: isError });
+          const pwd = await new Promise(resolve => {
+            this.#passwordPromiseResolve = resolve;
+          });
+          
+          // If user cancelled, pwd might be null, but let's assume they provide one or cancel the whole transfer
+          if (!pwd) {
+            this.#emit('cancelled');
+            return;
+          }
+
+          const salt = new Uint8Array(meta.aesSalt);
+          aesKey = await deriveKeyFromPassphrase(pwd, salt);
+          
+          if (meta.aesTest) {
+            try {
+              const testBuf = new Uint8Array(meta.aesTest).buffer;
+              await decryptChunk(testBuf, aesKey);
+              // Password is correct
+              break;
+            } catch (err) {
+              // Wrong password! Loop again.
+              isError = true;
+            }
+          } else {
+            break;
+          }
+        }
+      } else {
+        aesKey = this.#sharedKey;
+      }
+    }
+    this.#aesEnabled = meta.aesEnabled ?? false;
+    this.#aesKey = aesKey;
 
     this.#currentReceiver = {
       writer,
@@ -434,31 +598,46 @@ export class TransferManager extends EventTarget {
       lastSpeedUpdate: Date.now(),
       bytesAtLastUpdate: initialBytes,
       speed: 0,
-      chunks: [],
       chunksProcessed: savedChunks,
       transferCompleteMessageReceived: null,
+      decryptFn: this.#getDecryptFn(aesKey),
     };
 
     if (isResuming) {
-      this.#rtc.sendMessage({ type: MSG.RESUME_REQUEST, offset: initialBytes });
+      // Send chunk map for deduplication (which chunks we already have)
+      const knownChunks = [];
+      for (let i = 0; i < savedChunks; i++) knownChunks.push(i);
+
+      this.#rtc.sendMessage({
+        type: MSG.RESUME_REQUEST,
+        offset: initialBytes,
+        knownChunks,
+      });
       this.#emit('receive_started', { meta, isResuming: true, bytesReceived: initialBytes });
     } else {
-      // Accept the transfer
       this.#rtc.sendMessage({ type: MSG.FILE_ACCEPT, filename: meta.filename });
       this.#emit('receive_started', { meta, isResuming: false, bytesReceived: 0 });
     }
   }
 
-  async #handleChunk(encryptedData) {
+  async #handleChunk(rawData) {
     const r = this.#currentReceiver;
     if (!r) return;
+    if (this.#recvCancelled) return;
+
+    // Receiver pause: buffer the chunk and wait
+    if (this.#recvPaused) {
+      await new Promise(resolve => {
+        const handler = () => { resolve(); this.removeEventListener('_recv_resume', handler); };
+        this.addEventListener('_recv_resume', handler);
+      });
+    }
 
     try {
-      const decrypted = await decryptChunk(encryptedData, this.#sharedKey);
+      const decrypted = await r.decryptFn(rawData);
       await r.writer.write(decrypted);
       r.bytesReceived += decrypted.byteLength;
 
-      // Speed tracking
       const now = Date.now();
       const elapsed = (now - r.lastSpeedUpdate) / 1000;
       if (elapsed >= 0.5) {
@@ -474,12 +653,8 @@ export class TransferManager extends EventTarget {
         filename: r.meta.filename,
         bytesReceived: r.bytesReceived,
         totalSize: r.meta.size,
-        progress,
-        speed: r.speed,
-        meta: r.meta,
-        eta,
-        direction: 'receive',
-        status: 'transferring',
+        progress, speed: r.speed, meta: r.meta, eta,
+        direction: 'receive', status: 'transferring',
       });
 
       r.chunksProcessed++;
@@ -487,18 +662,16 @@ export class TransferManager extends EventTarget {
         await this.#finalizeReceiver(r, r.transferCompleteMessageReceived);
       }
     } catch (e) {
-      console.error('Decryption error in handleChunk:', e);
+      console.error('Decryption/write error in handleChunk:', e);
       this.#emit('decryption_error', { error: e.message });
-      this.cancel();
+      this.cancelReceive();
     }
   }
 
   async #handleTransferComplete(msg) {
     const r = this.#currentReceiver;
     if (!r) return;
-
     r.transferCompleteMessageReceived = msg;
-
     if (r.chunksProcessed === r.meta.totalChunks) {
       await this.#finalizeReceiver(r, msg);
     }
@@ -506,19 +679,11 @@ export class TransferManager extends EventTarget {
 
   async #finalizeReceiver(r, msg) {
     try {
-      // Finalize file write (which will trigger download, wait for background writes, verify hash, and delete from IndexedDB)
       const { receivedHash, hashMatch, blob } = await r.writer.finalize(r.meta.mimeType, msg.hash);
-
-      // Save completed hash to avoid re-downloading if connection drops right now
       this.#completedHashes.add(r.meta.hash);
-
-      // Send complete ACK to the sender
       this.#rtc.sendMessage({ type: MSG.TRANSFER_COMPLETE_ACK, hash: r.meta.hash });
-
       this.#emit('receive_complete', {
-        meta: r.meta,
-        hashMatch,
-        receivedHash,
+        meta: r.meta, hashMatch, receivedHash,
         expectedHash: msg.hash,
         duration: (Date.now() - r.startTime) / 1000,
         blob,
@@ -537,24 +702,70 @@ export class TransferManager extends EventTarget {
     this.#sendChunks(0);
   }
 
-  pause() {
-    this.#paused = true;
-    this.#emit('paused');
+  // --- Sender controls ---
+
+  pauseSend() {
+    this.#sendPaused = true;
+    this.#emit('paused', { direction: 'send' });
   }
 
-  resume() {
-    this.#paused = false;
-    this.dispatchEvent(new Event('resume'));
-    this.#emit('resumed');
+  resumeSend() {
+    this.#sendPaused = false;
+    this.dispatchEvent(new Event('_send_resume'));
+    this.#emit('resumed', { direction: 'send' });
   }
+
+  cancelSend() {
+    this.#sendCancelled = true;
+    if (this.#currentSender?.pipeline) {
+      this.#currentSender.pipeline.cancel();
+    }
+    this.#rtc.sendMessage({ type: MSG.CANCEL });
+    this.#currentSender = null;
+    this.#emit('cancelled', { direction: 'send' });
+  }
+
+  // --- Receiver controls ---
+
+  pauseReceive() {
+    this.#recvPaused = true;
+    // Ask sender to stop sending
+    this.#rtc.sendMessage({ type: MSG.PAUSE });
+    this.#emit('paused', { direction: 'receive' });
+  }
+
+  resumeReceive() {
+    this.#recvPaused = false;
+    this.dispatchEvent(new Event('_recv_resume'));
+    // Ask sender to resume
+    this.#rtc.sendMessage({ type: MSG.RESUME });
+    this.#emit('resumed', { direction: 'receive' });
+  }
+
+  cancelReceive() {
+    this.#recvCancelled = true;
+    if (this.#currentReceiver) {
+      deleteTransfer(this.#currentReceiver.meta.hash).catch(console.error);
+      this.#currentReceiver = null;
+    }
+    this.#rtc.sendMessage({ type: MSG.CANCEL });
+    this.#emit('cancelled', { direction: 'receive' });
+  }
+
+  // --- Legacy API (backwards compat) ---
+
+  pause() { this.pauseSend(); }
+
+  resume() { this.resumeSend(); }
 
   cancel() {
-    this.#cancelled = true;
+    this.#sendCancelled = true;
+    this.#recvCancelled = true;
     if (this.#currentSender?.pipeline) {
       this.#currentSender.pipeline.cancel();
     }
     if (this.#currentReceiver) {
-      deleteTransfer(this.#currentReceiver.meta.hash).catch(err => console.error(err));
+      deleteTransfer(this.#currentReceiver.meta.hash).catch(console.error);
       this.#currentReceiver = null;
     }
     this.#rtc.sendMessage({ type: MSG.CANCEL });

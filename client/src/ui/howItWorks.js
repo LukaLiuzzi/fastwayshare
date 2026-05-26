@@ -74,8 +74,47 @@ export function createHowItWorksSection() {
         `).join('')}
       </div>
 
+      <!-- Advanced Tech Features Showcase -->
+      <div class="text-center reveal" style="margin-top: var(--space-12); margin-bottom: var(--space-6);">
+        <h3 data-i18n="how.tech_title" style="font-family: var(--font-display); font-size: var(--text-2xl); font-weight: 700; color: var(--text-primary);">${t('how.tech_title') || 'Next-Gen Transfer Protocol'}</h3>
+        <p style="max-width:560px; margin: var(--space-2) auto 0; font-size: var(--text-sm); color: var(--text-secondary);" data-i18n="how.tech_subtitle">${t('how.tech_subtitle') || 'High-performance engine designed for speed, resilience, and maximum security.'}</p>
+      </div>
+
+      <div class="tech-features-grid reveal delay-2">
+        <div class="tech-feature-card">
+          <div class="tech-icon">🌐</div>
+          <h4 data-i18n="how.tech1_title">${t('how.tech1_title') || 'Ultra Local Mode'}</h4>
+          <p class="tech-desc" data-i18n="how.tech1_desc">${t('how.tech1_desc') || 'Bypasses TURN relays when devices share the same Wi-Fi network, ensuring maximum LAN speeds.'}</p>
+        </div>
+        <div class="tech-feature-card">
+          <div class="tech-icon">⚡</div>
+          <h4 data-i18n="how.tech2_title">${t('how.tech2_title') || 'Parallel DataChannels'}</h4>
+          <p class="tech-desc" data-i18n="how.tech2_desc">${t('how.tech2_desc') || 'Multiplexes files across multiple WebRTC DataChannels in parallel to overcome packet losses and boost throughput.'}</p>
+        </div>
+        <div class="tech-feature-card">
+          <div class="tech-icon">📈</div>
+          <h4 data-i18n="how.tech3_title">${t('how.tech3_title') || 'Adaptive Chunk Sizing'}</h4>
+          <p class="tech-desc" data-i18n="how.tech3_desc">${t('how.tech3_desc') || 'Dynamically scales chunk size based on real-time RTT and jitter tracking to optimize pipeline efficiency.'}</p>
+        </div>
+        <div class="tech-feature-card">
+          <div class="tech-icon">🛡️</div>
+          <h4 data-i18n="how.tech4_title">${t('how.tech4_title') || 'Passphrase-based AES-256'}</h4>
+          <p class="tech-desc" data-i18n="how.tech4_desc">${t('how.tech4_desc') || 'Optionally secure transfers with user passphrase key derivation using PBKDF2 on top of standard WebRTC encryption.'}</p>
+        </div>
+        <div class="tech-feature-card">
+          <div class="tech-icon">🔄</div>
+          <h4 data-i18n="how.tech5_title">${t('how.tech5_title') || 'Smart Deduplication'}</h4>
+          <p class="tech-desc" data-i18n="how.tech5_desc">${t('how.tech5_desc') || 'Skips transmission of already received file chunks during resume attempts, saving valuable bandwidth.'}</p>
+        </div>
+        <div class="tech-feature-card">
+          <div class="tech-icon">📱</div>
+          <h4 data-i18n="how.tech6_title">${t('how.tech6_title') || 'Mobile Optimization'}</h4>
+          <p class="tech-desc" data-i18n="how.tech6_desc">${t('how.tech6_desc') || 'Implements Screen Wake Lock, background transfer awareness, and automatic reconnection triggers.'}</p>
+        </div>
+      </div>
+
       <!-- Privacy bullets -->
-      <div class="privacy-bullets reveal">
+      <div class="privacy-bullets reveal" style="margin-top: var(--space-12);">
         ${PRIVACY_BULLETS.map(b => `
           <div class="privacy-bullet">
             <span class="bullet-icon">${b.icon}</span>
