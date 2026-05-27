@@ -88,13 +88,13 @@ export class RoomView {
           <div id="file-list-container" style="margin-top:var(--space-4);"></div>
 
           <!-- Room creation loading -->
-          <div class="card-flat hidden" id="room-creating-card" style="text-align: center; padding: var(--space-8) var(--space-6); background: rgba(10, 15, 26, 0.4); border-color: rgba(255, 255, 255, 0.05);">
+          <div class="card-flat hidden" id="room-creating-card" style="text-align: center; padding: var(--space-8) var(--space-6);">
             <span class="anim-spin" style="font-size:2.5rem; display:block; margin-bottom:var(--space-4);">⏳</span>
             <p class="text-secondary" data-i18n="room.creating">${t('room.creating')}</p>
           </div>
 
           <!-- Room setup info -->
-          <div class="card-flat hidden" id="room-setup-card" style="background: rgba(10, 15, 26, 0.4); border-color: rgba(255, 255, 255, 0.05);"></div>
+          <div class="card-flat hidden" id="room-setup-card"></div>
 
           <!-- Advanced Options Send -->
           <div id="advanced-options-send"></div>
@@ -126,7 +126,7 @@ export class RoomView {
             </button>
           </div>
 
-          <div class="card-flat hidden" id="connection-card" style="background: rgba(10, 15, 26, 0.4); border-color: rgba(255, 255, 255, 0.05);"></div>
+          <div class="card-flat hidden" id="connection-card"></div>
 
 
 
