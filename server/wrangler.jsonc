@@ -20,6 +20,14 @@
       "new_sqlite_classes": ["SignalingRoom"]
     }
   ],
+  // ─── Cloudflare TURN secrets ──────────────────────────────────────────────
+  // These secrets enable the /turn-credentials endpoint.
+  // Set them with:
+  //   npx wrangler secret put CLOUDFLARE_TURN_KEY_ID
+  //   npx wrangler secret put CLOUDFLARE_TURN_KEY_TOKEN
+  //
+  // Get them from: https://dash.cloudflare.com -> Realtime -> TURN Keys
+  // ─────────────────────────────────────────────────────────────────────────
   "observability": {
     "enabled": false,
     "head_sampling_rate": 1,

@@ -12,7 +12,7 @@
 import { DATACHANNEL_LABEL, MSG } from '../utils/constants.js';
 import { filterICEServers, detectConnectionLocality } from './networkDetect.js';
 
-const ULTRA_LOCAL_TIMEOUT_MS = 5000; // 5s — if no connection with STUN-only, add TURN
+const ULTRA_LOCAL_TIMEOUT_MS = 6000; // 6s — if no connection with STUN-only, add TURN
 
 export class WebRTCManager extends EventTarget {
   /** @type {RTCPeerConnection|null} */
@@ -111,12 +111,23 @@ export class WebRTCManager extends EventTarget {
 
   #scheduleUltraLocalFallback(signalingClient) {
     const timer = setTimeout(async () => {
-      // If still not connected, add TURN servers and restart ICE
+      // If still not connected, add TURN servers and restart ICE with a full
+      // offer/answer renegotiation. restartIce() alone only updates local
+      // credentials — the remote peer must receive a new offer to accept them.
       if (this.#pc && this.#pc.connectionState !== 'connected') {
-        console.log('[WebRTC] Ultra-local fallback: adding TURN servers');
+        console.log('[WebRTC] Ultra-local fallback: adding TURN servers and restarting ICE');
         try {
           this.#pc.setConfiguration({ iceServers: this.#allIceServers });
-          await this.#pc.restartIce?.();
+
+          if (this.#isSender) {
+            // Sender: create a new offer with iceRestart:true and send it
+            const restartOffer = await this.#pc.createOffer({ iceRestart: true });
+            await this.#pc.setLocalDescription(restartOffer);
+            signalingClient.send({ type: 'OFFER', sdp: restartOffer });
+          } else {
+            // Receiver: signal the sender to trigger an ICE restart offer
+            signalingClient.send({ type: 'ICE_RESTART_REQUEST' });
+          }
         } catch (e) {
           console.warn('[WebRTC] ICE restart failed:', e);
         }

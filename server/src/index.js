@@ -22,6 +22,15 @@ export { SignalingRoom } from './room.js';
 
 const VERSION = '1.0.0';
 
+/** TURN credential cache — re-use until 1h before expiry. */
+let turnCredentialCache = null; // { iceServers: [], expiresAt: number }
+
+/** Cloudflare TURN credentials API endpoint. */
+const CF_TURN_API = 'https://rtc.live.cloudflare.com/v1/turn/keys';
+
+/** TTL for generated TURN credentials (24 hours in seconds). */
+const TURN_TTL_SECONDS = 86400;
+
 /** Characters used when generating the letter part of a room code (A-Z). */
 const ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 
@@ -115,6 +124,87 @@ function checkRateLimit(ip) {
 }
 
 // ─── Route handlers ──────────────────────────────────────────────────────────
+
+/**
+ * GET /turn-credentials
+ * Returns short-lived Cloudflare TURN ICE server credentials.
+ * Credentials are cached in-memory for ~23 hours to avoid hitting the API
+ * on every WebRTC session.
+ *
+ * Requires Worker secrets:
+ *   CLOUDFLARE_TURN_KEY_ID    — the TURN key ID from the Cloudflare dashboard
+ *   CLOUDFLARE_TURN_KEY_TOKEN — the API token scoped to the TURN key
+ *
+ * @param {Request} request
+ * @param {object}  env
+ * @returns {Promise<Response>}
+ */
+async function handleTurnCredentials(request, env) {
+  // If TURN key secrets are not configured, return STUN-only gracefully.
+  if (!env.CLOUDFLARE_TURN_KEY_ID || !env.CLOUDFLARE_TURN_KEY_TOKEN) {
+    return jsonResponse(
+      {
+        iceServers: [
+          { urls: 'stun:stun.cloudflare.com:3478' },
+          { urls: 'stun:stun.l.google.com:19302' },
+        ],
+        note: 'TURN secrets not configured — STUN only',
+      },
+      200,
+      request,
+    );
+  }
+
+  // Return cached credentials if still valid (> 1h remaining).
+  const now = Date.now();
+  if (turnCredentialCache && turnCredentialCache.expiresAt - now > 3_600_000) {
+    return jsonResponse({ iceServers: turnCredentialCache.iceServers }, 200, request);
+  }
+
+  // Generate new credentials from the Cloudflare Realtime API.
+  try {
+    const apiUrl = `${CF_TURN_API}/${env.CLOUDFLARE_TURN_KEY_ID}/credentials/generate-ice-servers`;
+    const apiRes = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.CLOUDFLARE_TURN_KEY_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ ttl: TURN_TTL_SECONDS }),
+    });
+
+    if (!apiRes.ok) {
+      const errText = await apiRes.text().catch(() => '');
+      console.error('[TURN] Cloudflare API error:', apiRes.status, errText);
+      return jsonResponse(
+        { error: 'Failed to generate TURN credentials.' },
+        502,
+        request,
+      );
+    }
+
+    const data = await apiRes.json();
+
+    // Filter out port-53 URLs — blocked by Chrome and Firefox.
+    const iceServers = (data.iceServers ?? []).map((s) => {
+      if (!s.urls) return s;
+      const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+      const filtered = urls.filter((u) => !u.includes(':53'));
+      return { ...s, urls: filtered };
+    }).filter((s) => (Array.isArray(s.urls) ? s.urls.length > 0 : !!s.urls));
+
+    // Cache for the credential lifetime.
+    turnCredentialCache = {
+      iceServers,
+      expiresAt: now + TURN_TTL_SECONDS * 1_000,
+    };
+
+    return jsonResponse({ iceServers }, 201, request);
+  } catch (err) {
+    console.error('[TURN] Unexpected error:', err);
+    return jsonResponse({ error: 'Internal server error generating TURN credentials.' }, 500, request);
+  }
+}
 
 /**
  * GET /health
@@ -216,6 +306,11 @@ export default {
     // GET /health
     if (method === 'GET' && pathname === '/health') {
       return handleHealth(request);
+    }
+
+    // GET /turn-credentials  → ephemeral Cloudflare TURN credentials
+    if (method === 'GET' && pathname === '/turn-credentials') {
+      return handleTurnCredentials(request, env);
     }
 
     // POST /room  → create a new room

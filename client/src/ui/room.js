@@ -14,6 +14,7 @@ import {
 	deriveSharedKey,
 } from '../core/crypto.js';
 import { MSG, ROOM_CODE_REGEX } from '../utils/constants.js';
+import { fetchTURNCredentials } from '../utils/constants.js';
 import { copyToClipboard, addRipple } from '../utils/helpers.js';
 import { createQRSection } from './qrcode.js';
 import { Dropzone, createFileList } from './dropzone.js';
@@ -22,6 +23,7 @@ import { addHistoryEntry } from './history.js';
 import { notifyTransferComplete, showToast } from './notification.js';
 import { requestNotificationPermission } from './notification.js';
 import { createAdvancedOptions } from './advancedOptions.js';
+import { settings } from '../core/settings.js';
 
 export class RoomView {
 	#container;
@@ -430,11 +432,31 @@ export class RoomView {
 			// Both peers initialize WebRTC once they have the other's public key.
 			// The sender acts as the initiator. Close existing connection first.
 			this.#rtc.close();
-			await this.#rtc.init(this.#signaling, role === 'sender');
+			// Fetch Cloudflare TURN credentials (cached after first call).
+			const iceServers = await fetchTURNCredentials();
+			await this.#rtc.init(this.#signaling, role === 'sender', {
+				iceServers,
+				channelCount: settings.get('parallelChannels'),
+			});
 		});
 
 		this.#signaling.addEventListener('OFFER', async (e) => {
 			await this.#rtc.handleOffer(e.detail.sdp, this.#signaling);
+		});
+
+		// ICE restart request: receiver asks sender to restart ICE with TURN
+		this.#signaling.addEventListener('ICE_RESTART_REQUEST', async () => {
+			if (role === 'sender' && this.#rtc) {
+				try {
+					const restartOffer = await this.#rtc.pc?.createOffer({ iceRestart: true });
+					if (restartOffer) {
+						await this.#rtc.pc.setLocalDescription(restartOffer);
+						this.#signaling.send({ type: MSG.OFFER, sdp: restartOffer });
+					}
+				} catch (e) {
+					console.warn('[Room] ICE restart offer failed:', e);
+				}
+			}
 		});
 
 		this.#signaling.addEventListener('ANSWER', async (e) => {

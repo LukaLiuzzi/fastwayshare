@@ -7,23 +7,32 @@
 export const SIGNALING_URL =
 	import.meta.env.VITE_SIGNALING_URL || 'wss://fastwayshare.workers.dev';
 
-// WebRTC configuration — default ICE servers (overridable via settings)
+// WebRTC configuration — ICE servers with free public TURN (Open Relay)
 export const DEFAULT_ICE_SERVERS = [
-	// Free STUN servers (Google + Cloudflare)
-	{ urls: 'stun:stun.l.google.com:19302' },
-	{ urls: 'stun:stun1.l.google.com:19302' },
+	// STUN servers
 	{ urls: 'stun:stun.cloudflare.com:3478' },
-	// Optional TURN servers — users can override via env/config
-	...(import.meta.env.VITE_TURN_URLS
-		? [
-				{
-					urls: import.meta.env.VITE_TURN_URLS.split(','),
-					username: import.meta.env.VITE_TURN_USERNAME || '',
-					credential: import.meta.env.VITE_TURN_CREDENTIAL || '',
-				},
-			]
-		: []),
+	{ urls: 'stun:stun.l.google.com:19302' },
+	// Open Relay — free public TURN server for NAT traversal.
+	// Required for connections across different networks (symmetric NAT).
+	{
+		urls: [
+			'turn:openrelay.metered.ca:80',
+			'turn:openrelay.metered.ca:443',
+			'turns:openrelay.metered.ca:443',
+		],
+		username: 'openrelayproject',
+		credential: 'openrelayproject',
+	},
 ];
+
+/**
+ * Returns the ICE servers to use for RTCPeerConnection.
+ * Async to maintain API compatibility if a dynamic source is added later.
+ * @returns {Promise<RTCIceServer[]>}
+ */
+export async function fetchTURNCredentials() {
+	return DEFAULT_ICE_SERVERS;
+}
 
 // Keep legacy export alias for backward compat
 export const ICE_SERVERS = DEFAULT_ICE_SERVERS;

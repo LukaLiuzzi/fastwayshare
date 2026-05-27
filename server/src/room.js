@@ -235,7 +235,7 @@ export class SignalingRoom extends DurableObject {
 
     // ── Relay messages ───────────────────────────────────────────────────
     // OFFER, ANSWER, ICE, ECDH_KEY are forwarded verbatim to the OTHER peer.
-    const RELAY_TYPES = new Set(['OFFER', 'ANSWER', 'ICE', 'ECDH_KEY']);
+    const RELAY_TYPES = new Set(['OFFER', 'ANSWER', 'ICE', 'ECDH_KEY', 'ICE_RESTART_REQUEST']);
     if (RELAY_TYPES.has(type)) {
       const otherPeerId = senderPeerId === '0' ? '1' : '0';
       const otherPeer = this.peers.get(otherPeerId);
