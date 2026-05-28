@@ -67,29 +67,64 @@ export class App {
           </a>
 
           <div class="navbar-actions">
-            <a href="#how-it-works" class="btn btn-ghost btn-sm">
-              <span data-i18n="nav.how_it_works">${t('nav.how_it_works')}</span>
-            </a>
-            <a href="https://github.com/LukaLiuzzi/fastwayshare" target="_blank" rel="noopener" class="btn btn-ghost btn-sm">
-              <span data-i18n="nav.github">${t('nav.github')} ↗</span>
+            <a href="https://github.com/LukaLiuzzi/fastwayshare" target="_blank" rel="noopener" class="btn btn-ghost btn-sm github-btn" title="GitHub">
+              <span class="github-star">⭐</span>
+              <span class="github-text">GitHub ↗</span>
             </a>
 
-            <!-- Language toggle -->
-            <div class="control-group" id="lang-toggle">
-              <button class="toggle-btn ${getLang() === 'en' ? 'active' : ''}" data-lang="en" id="btn-lang-en">EN</button>
-              <button class="toggle-btn ${getLang() === 'es' ? 'active' : ''}" data-lang="es" id="btn-lang-es">ES</button>
+            <!-- Settings Dropdown -->
+            <div class="settings-dropdown-wrapper">
+              <button class="btn btn-icon btn-sm" id="settings-toggle-btn" aria-label="Settings" data-i18n-title="nav.settings" title="${t('nav.settings')}">
+                ⚙️
+              </button>
+              <div class="settings-dropdown hidden" id="settings-dropdown-menu">
+                <div class="settings-dropdown-item">
+                  <a href="#how-it-works" class="settings-dropdown-link" id="how-it-works-dropdown-btn">
+                    ❓ <span data-i18n="nav.how_it_works">${t('nav.how_it_works')}</span>
+                  </a>
+                </div>
+                <div class="settings-dropdown-divider"></div>
+                <div class="settings-dropdown-item">
+                  <span class="settings-dropdown-label" data-i18n="settings.theme">${t('settings.theme')}</span>
+                  <button class="btn-icon btn" id="theme-toggle-btn" aria-label="Toggle theme"
+                    data-i18n-title="${getTheme() === 'dark' ? 'theme.light' : 'theme.dark'}"
+                    title="${getTheme() === 'dark' ? t('theme.light') : t('theme.dark')}">
+                    ${getTheme() === 'dark' ? '☀️' : '🌙'}
+                  </button>
+                </div>
+                <div class="settings-dropdown-item">
+                  <span class="settings-dropdown-label" data-i18n="settings.language">${t('settings.language')}</span>
+                  <div class="control-group" id="lang-toggle">
+                    <button class="toggle-btn ${getLang() === 'en' ? 'active' : ''}" data-lang="en" id="btn-lang-en">EN</button>
+                    <button class="toggle-btn ${getLang() === 'es' ? 'active' : ''}" data-lang="es" id="btn-lang-es">ES</button>
+                  </div>
+                </div>
+              </div>
             </div>
-
-            <!-- Theme toggle -->
-            <button class="btn-icon btn" id="theme-toggle-btn" aria-label="Toggle theme"
-              data-i18n-title="${getTheme() === 'dark' ? 'theme.light' : 'theme.dark'}"
-              title="${getTheme() === 'dark' ? t('theme.light') : t('theme.dark')}">
-              ${getTheme() === 'dark' ? '☀️' : '🌙'}
-            </button>
           </div>
         </div>
       </div>
     `;
+
+		// Settings dropdown toggle
+		const settingsToggle = nav.querySelector('#settings-toggle-btn');
+		const settingsDropdown = nav.querySelector('#settings-dropdown-menu');
+
+		settingsToggle.addEventListener('click', (e) => {
+			e.stopPropagation();
+			settingsDropdown.classList.toggle('hidden');
+		});
+
+		document.addEventListener('click', (e) => {
+			if (!settingsDropdown.classList.contains('hidden') && !settingsDropdown.contains(e.target) && e.target !== settingsToggle) {
+				settingsDropdown.classList.add('hidden');
+			}
+		});
+
+		// Close dropdown when clicking "How it works"
+		nav.querySelector('#how-it-works-dropdown-btn').addEventListener('click', () => {
+			settingsDropdown.classList.add('hidden');
+		});
 
 		// Theme toggle
 		nav.querySelector('#theme-toggle-btn').addEventListener('click', (e) => {

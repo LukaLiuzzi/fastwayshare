@@ -5,6 +5,9 @@
 
   "nav.how_it_works": "How it works",
   "nav.github": "⭐ GitHub",
+  "nav.settings": "Settings",
+  "settings.theme": "Theme",
+  "settings.language": "Language",
   "footer.open_source": "⭐ Open Source",
 
   "hero.eyebrow": "Browser to browser • No registration • 100% Free",
