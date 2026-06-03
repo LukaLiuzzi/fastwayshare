@@ -42,9 +42,9 @@ export const DATACHANNEL_LABEL = 'fastwayshare-data';
 export const DATACHANNEL_COUNT_DEFAULT = 4; // parallel DataChannels
 
 // Chunk sizes
-export const CHUNK_SIZE = 64 * 1024;        // default 64KB
-export const MIN_CHUNK_SIZE = 32 * 1024;    // 32KB — high jitter / slow links
-export const MAX_CHUNK_SIZE = 256 * 1024;   // 256KB — LAN / low latency
+export const CHUNK_SIZE = 16 * 1024;        // default 16KB (Safe for TURN)
+export const MIN_CHUNK_SIZE = 8 * 1024;     // 8KB — high jitter / slow links
+export const MAX_CHUNK_SIZE = 64 * 1024;    // 64KB — LAN / low latency
 
 // Crypto constants
 export const CRYPTO_CURVE = 'P-256';

@@ -354,7 +354,7 @@ export async function compressToZip(files, folderName = 'files') {
   return new Promise((resolve, reject) => {
     zip(fileData, { level: 1 }, (err, data) => {
       if (err) return reject(err);
-      resolve({ data: data.buffer, size: data.byteLength });
+      resolve({ data, size: data.byteLength });
     });
   });
 }
